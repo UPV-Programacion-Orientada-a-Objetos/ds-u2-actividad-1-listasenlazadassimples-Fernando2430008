@@ -1,5 +1,8 @@
 #include <iostream>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
 
 using namespace std;
 
@@ -22,6 +25,40 @@ private:
 public:
     // constructor
     ListaSensor() : cabeza(nullptr), cantidad(0) {}
+    
+    // constructor de copia
+    ListaSensor(const ListaSensor<T>& otra) : cabeza(nullptr), cantidad(0) {
+        Nodo<T>* actual = otra.cabeza;
+        while (actual != nullptr) {
+            insertar(actual->dato);
+            actual = actual->siguiente;
+        }
+    }
+    
+    // operador de asignacion
+    ListaSensor<T>& operator=(const ListaSensor<T>& otra) {
+        if (this == &otra) return *this;
+        
+        // liberar memoria actual
+        Nodo<T>* actual = cabeza;
+        while (actual != nullptr) {
+            Nodo<T>* siguiente = actual->siguiente;
+            delete actual;
+            actual = siguiente;
+        }
+        
+        cabeza = nullptr;
+        cantidad = 0;
+        
+        // copiar de la otra lista
+        actual = otra.cabeza;
+        while (actual != nullptr) {
+            insertar(actual->dato);
+            actual = actual->siguiente;
+        }
+        
+        return *this;
+    }
     
     // destructor - libera toda la memoria
     ~ListaSensor() {
@@ -302,6 +339,92 @@ public:
     }
 };
 
+// clase simple para comunicacion con arduino
+class ArduinoSerial {
+private:
+    int fd;
+    
+public:
+    ArduinoSerial(const char* puerto) {
+        fd = open(puerto, O_RDWR | O_NOCTTY);
+        
+        if (fd < 0) {
+            cout << "error abriendo puerto" << endl;
+            return;
+        }
+        
+        // configurar puerto serial
+        struct termios opciones;
+        tcgetattr(fd, &opciones);
+        cfsetispeed(&opciones, B9600);
+        cfsetospeed(&opciones, B9600);
+        opciones.c_cflag &= ~PARENB;
+        opciones.c_cflag &= ~CSTOPB;
+        opciones.c_cflag &= ~CSIZE;
+        opciones.c_cflag |= CS8;
+        tcsetattr(fd, TCSANOW, &opciones);
+        
+        usleep(2000000); // esperar 2 segundos para arduino
+    }
+    
+    ~ArduinoSerial() {
+        if (fd >= 0) close(fd);
+    }
+    
+    // leer una linea del puerto
+    bool leerLinea(char* buffer, int maxSize) {
+        if (fd < 0) return false;
+        
+        int bytesLeidos = 0;
+        char c;
+        
+        while (bytesLeidos < maxSize - 1) {
+            int resultado = read(fd, &c, 1);
+            if (resultado <= 0) break;
+            if (c == '\n') break;
+            if (c != '\r') buffer[bytesLeidos++] = c;
+        }
+        
+        buffer[bytesLeidos] = '\0';
+        return bytesLeidos > 0;
+    }
+};
+
+// estructura para datos del sensor
+struct DatoSensor {
+    char tipo[10];
+    char id[50];
+    float valor;
+    bool valido;
+};
+
+// parsear linea del formato: "TEMP,T-001,23.5"
+DatoSensor parsearLinea(const char* linea) {
+    DatoSensor dato;
+    dato.valido = false;
+    
+    char copia[256];
+    strncpy(copia, linea, 255);
+    copia[255] = '\0';
+    
+    char* token = strtok(copia, ",");
+    if (token == nullptr) return dato;
+    strncpy(dato.tipo, token, 9);
+    dato.tipo[9] = '\0';
+    
+    token = strtok(nullptr, ",");
+    if (token == nullptr) return dato;
+    strncpy(dato.id, token, 49);
+    dato.id[49] = '\0';
+    
+    token = strtok(nullptr, ",");
+    if (token == nullptr) return dato;
+    dato.valor = atof(token);
+    
+    dato.valido = true;
+    return dato;
+}
+
 int main() {
     // crear sistema de gestion
     ListaGestion* sistema = new ListaGestion();
@@ -310,14 +433,15 @@ int main() {
     
     int opcion = 0;
     
-    while (opcion != 6) {
+    while (opcion != 7) {
         cout << "\n--- menu ---" << endl;
         cout << "1. crear sensor de temperatura" << endl;
         cout << "2. crear sensor de presion" << endl;
         cout << "3. registrar lectura" << endl;
         cout << "4. listar sensores" << endl;
         cout << "5. procesar sensores" << endl;
-        cout << "6. salir" << endl;
+        cout << "6. leer desde arduino" << endl;
+        cout << "7. salir" << endl;
         cout << "opcion: ";
         cin >> opcion;
         
@@ -398,6 +522,66 @@ int main() {
             }
             
             case 6: {
+                // leer desde arduino
+                cout << "\nconectando a arduino..." << endl;
+                cout << "puerto (ejemplo: /dev/ttyUSB0 o /dev/ttyACM0): ";
+                char puerto[50];
+                cin >> puerto;
+                
+                ArduinoSerial arduino(puerto);
+                
+                char buffer[256];
+                int lecturas = 0;
+                int maxLecturas = 10;
+                
+                cout << "leyendo " << maxLecturas << " datos del arduino..." << endl;
+                
+                while (lecturas < maxLecturas) {
+                    if (arduino.leerLinea(buffer, 256)) {
+                        cout << "recibido: " << buffer << endl;
+                        
+                        DatoSensor dato = parsearLinea(buffer);
+                        
+                        if (dato.valido) {
+                            SensorBase* sensor = sistema->buscarSensor(dato.id);
+                            
+                            // crear sensor si no existe
+                            if (sensor == nullptr) {
+                                if (strcmp(dato.tipo, "TEMP") == 0) {
+                                    sensor = new SensorTemperatura(dato.id);
+                                    sistema->insertarSensor(sensor);
+                                    cout << "sensor temperatura creado: " << dato.id << endl;
+                                } else if (strcmp(dato.tipo, "PRES") == 0) {
+                                    sensor = new SensorPresion(dato.id);
+                                    sistema->insertarSensor(sensor);
+                                    cout << "sensor presion creado: " << dato.id << endl;
+                                }
+                            }
+                            
+                            // registrar lectura
+                            if (sensor != nullptr) {
+                                SensorTemperatura* temp = dynamic_cast<SensorTemperatura*>(sensor);
+                                if (temp != nullptr) {
+                                    temp->registrarLectura(dato.valor);
+                                } else {
+                                    SensorPresion* pres = dynamic_cast<SensorPresion*>(sensor);
+                                    if (pres != nullptr) {
+                                        pres->registrarLectura((int)dato.valor);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        lecturas++;
+                    }
+                    usleep(100000);
+                }
+                
+                cout << "lecturas completadas: " << lecturas << endl;
+                break;
+            }
+            
+            case 7: {
                 cout << "\ncerrando sistema..." << endl;
                 break;
             }
